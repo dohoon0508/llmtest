@@ -46,11 +46,13 @@ USER_PROMPT_TEMPLATE = """당신은 건축 인허가 실무를 돕는 AI입니�
 
 위 자료를 우선적으로 사용해서 한국어로 구조화된 형식으로 답변하세요."""
 
-def get_rag_prompt(query: str, context: str, scenario: str = None) -> str:
+def get_rag_prompt(query: str, context: str, scenario: str = None, region: str = None) -> str:
     """RAG 프롬프트 생성"""
     scenario_text = scenario or "건축허가"
+    region_text = f" ({region})" if region else ""
+    scenario_with_region = f"{scenario_text}{region_text}" if region else scenario_text
     return USER_PROMPT_TEMPLATE.format(
-        scenario=scenario_text,
+        scenario=scenario_with_region,
         context=context,
         query=query
     )

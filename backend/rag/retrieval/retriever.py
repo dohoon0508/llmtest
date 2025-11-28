@@ -143,127 +143,143 @@ class Retriever:
         similarity_failed_count = 0
         passed_count = 0
         
-        for idx, vec in enumerate(self.vectors):
+        # 성능 최적화: 먼저 필터링 인덱스 생성 (한 번만)
+        import unicodedata
+        valid_indices = []
+        
+        # 1단계: 폴더 및 파일명 필터링으로 유효한 인덱스만 추출
+        for idx in range(len(self.vectors)):
             try:
                 metadata = self.metadatas[idx] if idx < len(self.metadatas) else {}
                 
-                # 폴더 필터링: 메타데이터의 folder 필드 확인
+                # 폴더 필터링
                 if folder_filter:
                     metadata_folder = metadata.get("folder", "")
-                    # 빈 문자열이나 None 체크
                     if not metadata_folder:
                         continue
-                    
-                    # 유니코드 정규화 (NFC 정규화로 통일)
-                    import unicodedata
                     metadata_folder_clean = unicodedata.normalize('NFC', str(metadata_folder).strip())
                     folder_filter_clean = unicodedata.normalize('NFC', str(folder_filter).strip())
-                    
-                    # 정확한 매칭
                     if metadata_folder_clean != folder_filter_clean:
                         continue
                 
-                # 파일명 필터링: 4, 5-1, 5-2만 허용
+                # 파일명 필터링
                 if filename_filter:
                     filename = metadata.get("filename", "")
                     if not filename:
                         continue
-                    # 파일명이 필터 목록에 있는지 확인
-                    # 예: "4.검토항목.doc" -> "4." 또는 "5-1." 또는 "5-2."로 시작하는지 확인
-                    matches = False
-                    for filter_name in filename_filter:
-                        if filename.startswith(filter_name):
-                            matches = True
-                            break
+                    matches = any(filename.startswith(fn) for fn in filename_filter)
                     if not matches:
                         filtered_count += 1
                         continue
+                
+                valid_indices.append(idx)
             except Exception as e:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"메타데이터 처리 중 오류 (인덱스 {idx}, 스킵): {str(e)}")
                 filtered_count += 1
                 continue
+        
+        if not valid_indices:
+            logger.warning(f"필터링 후 유효한 벡터가 없습니다. (폴더: {folder_filter}, 파일: {filename_filter})")
+            return []
+        
+        logger.info(f"필터링 완료: {len(valid_indices)}/{len(self.vectors)}개 벡터가 검색 대상")
+        
+        # 2단계: 벡터화된 유사도 계산 (전체 행렬 연산으로 최적화)
+        try:
+            # 유효한 벡터만 추출
+            valid_vectors = np.array([self.vectors[idx] for idx in valid_indices])
             
-            try:
-                doc_vec = np.array(vec)
-                
-                # 벡터 길이 확인
-                query_norm = np.linalg.norm(query_vec)
-                doc_norm = np.linalg.norm(doc_vec)
-                
-                if query_norm == 0 or doc_norm == 0:
+            # 정규화된 벡터 계산
+            query_norm = np.linalg.norm(query_vec)
+            if query_norm == 0:
+                return []
+            
+            # 모든 문서 벡터 정규화
+            doc_norms = np.linalg.norm(valid_vectors, axis=1)
+            valid_doc_mask = doc_norms > 0
+            
+            if not np.any(valid_doc_mask):
+                return []
+            
+            # 유사도 계산 (벡터화)
+            similarities = np.dot(valid_vectors[valid_doc_mask], query_vec) / (query_norm * doc_norms[valid_doc_mask])
+            
+            # 유효한 인덱스 재매핑
+            valid_indices_filtered = [valid_indices[i] for i in range(len(valid_indices)) if valid_doc_mask[i]]
+            
+            # 임계값 필터링
+            threshold_mask = (similarities >= similarity_threshold) & np.isfinite(similarities)
+            passed_indices = [valid_indices_filtered[i] for i in range(len(valid_indices_filtered)) if threshold_mask[i]]
+            passed_similarities = similarities[threshold_mask]
+            
+            if not passed_indices:
+                logger.info("유사도 임계값을 통과한 벡터가 없습니다.")
+                return []
+            
+            # 점수 계산을 위한 루프 (최적화: 필요한 경우만)
+            weighted_scores = []
+            passed_count = len(passed_indices)
+            
+            for idx, base_similarity in zip(passed_indices, passed_similarities):
+                try:
+                    metadata = self.metadatas[idx] if idx < len(self.metadatas) else {}
+                    base_similarity = float(base_similarity)
+                    
+                    # 시나리오 일치 보정 (scenario 필드 확인)
+                    bonus = 0.0
+                    scenario = metadata.get("scenario") or metadata.get("folder")
+                    if folder_filter and scenario:
+                        scenario_clean = unicodedata.normalize('NFC', str(scenario).strip())
+                        folder_filter_clean = unicodedata.normalize('NFC', str(folder_filter).strip())
+                        if scenario_clean == folder_filter_clean:
+                            bonus += 0.1  # 시나리오 일치 시 +0.1 가산점
+                    
+                    # 용도 일치 보정
+                    usage = metadata.get("usage")
+                    if usage and folder_filter:
+                        if "판매시설" in folder_filter and "판매시설" in str(usage):
+                            bonus += 0.05
+                        elif "숙박시설" in folder_filter and "숙박시설" in str(usage):
+                            bonus += 0.05
+                        elif "다중주택" in folder_filter and "다중주택" in str(usage):
+                            bonus += 0.05
+                        elif "단독주택" in folder_filter and "단독주택" in str(usage):
+                            bonus += 0.05
+                    
+                    # 최종 점수 (유사도 + 보정)
+                    similarity = base_similarity + bonus
+                    
+                    # 가중치 적용
+                    weighted_score = similarity * self.similarity_weight
+                    
+                    # 최신성 가중치
+                    if self.recency_weight > 0:
+                        created_at_str = metadata.get("created_at", "")
+                        if created_at_str:
+                            try:
+                                created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                                days_old = (current_time - created_at.replace(tzinfo=None)).days
+                                recency_score = max(0, 1 - (days_old / 365))
+                                weighted_score += recency_score * self.recency_weight
+                            except:
+                                pass
+                    
+                    # 출처 가중치
+                    if self.source_weight > 0 and preferred_sources:
+                        source = metadata.get("source", "")
+                        if source in preferred_sources:
+                            weighted_score += self.source_weight
+                    
+                    weighted_scores.append({
+                        "idx": idx,
+                        "similarity": similarity,
+                        "weighted_score": weighted_score
+                    })
+                except Exception as e:
+                    logger.warning(f"Error calculating similarity for vector {idx}: {str(e)}")
                     continue
-                
-                # 기본 유사도 계산
-                base_similarity = float(np.dot(query_vec, doc_vec) / (query_norm * doc_norm))
-                
-                # NaN이나 무한대 값 체크
-                if not np.isfinite(base_similarity) or base_similarity < similarity_threshold:
-                    similarity_failed_count += 1
-                    continue
-                
-                passed_count += 1
-                
-                # 시나리오 일치 보정 (scenario 필드 확인)
-                bonus = 0.0
-                scenario = metadata.get("scenario") or metadata.get("folder")
-                if folder_filter and scenario:
-                    import unicodedata
-                    scenario_clean = unicodedata.normalize('NFC', str(scenario).strip())
-                    folder_filter_clean = unicodedata.normalize('NFC', str(folder_filter).strip())
-                    if scenario_clean == folder_filter_clean:
-                        bonus += 0.1  # 시나리오 일치 시 +0.1 가산점
-                
-                # 용도 일치 보정
-                usage = metadata.get("usage")
-                if usage and folder_filter:
-                    # 폴더명에서 용도 추출 (예: "신축_일반개인_판매시설(도매시장)" -> "판매시설")
-                    if "판매시설" in folder_filter and "판매시설" in str(usage):
-                        bonus += 0.05
-                    elif "숙박시설" in folder_filter and "숙박시설" in str(usage):
-                        bonus += 0.05
-                    elif "다중주택" in folder_filter and "다중주택" in str(usage):
-                        bonus += 0.05
-                    elif "단독주택" in folder_filter and "단독주택" in str(usage):
-                        bonus += 0.05
-                
-                # 최종 점수 (유사도 + 보정)
-                similarity = base_similarity + bonus
-            except Exception as e:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Error calculating similarity for vector {idx}: {str(e)}")
-                continue
-            
-            # 가중치 적용
-            weighted_score = similarity * self.similarity_weight
-            
-            # 최신성 가중치
-            if self.recency_weight > 0:
-                metadata = self.metadatas[idx]
-                created_at_str = metadata.get("created_at", "")
-                if created_at_str:
-                    try:
-                        created_at = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
-                        days_old = (current_time - created_at.replace(tzinfo=None)).days
-                        recency_score = max(0, 1 - (days_old / 365))  # 1년 기준 정규화
-                        weighted_score += recency_score * self.recency_weight
-                    except:
-                        pass
-            
-            # 출처 가중치
-            if self.source_weight > 0 and preferred_sources:
-                metadata = self.metadatas[idx]
-                source = metadata.get("source", "")
-                if source in preferred_sources:
-                    weighted_score += self.source_weight
-            
-            weighted_scores.append({
-                "idx": idx,
-                "similarity": similarity,
-                "weighted_score": weighted_score
-            })
+        except Exception as e:
+            logger.error(f"벡터화된 유사도 계산 실패: {str(e)}", exc_info=True)
+            return []
         
         # 디버깅: 검색 통계 로깅
         logger.info(f"검색 통계: 필터링됨={filtered_count}, 유사도 실패={similarity_failed_count}, 통과={passed_count}, 최종 점수={len(weighted_scores)}")

@@ -8,39 +8,60 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-rag_service = RAGService()
+rag_service = None
+
+def get_rag_service():
+    """RAG 서비스 인스턴스 가져오기 (지연 초기화)"""
+    global rag_service
+    if rag_service is None:
+        try:
+            logger.info("RAG 서비스 초기화 시작...")
+            rag_service = RAGService()
+            logger.info("RAG 서비스 초기화 완료")
+        except Exception as e:
+            error_detail = f"{str(e)}\n{traceback.format_exc()}"
+            logger.error(f"RAG 서비스 초기화 실패: {error_detail}")
+            raise RuntimeError(f"RAG 서비스 초기화 실패: {str(e)}") from e
+    return rag_service
 
 @router.post("/query", response_model=QueryResponse)
 async def query_documents(
     request: QueryRequest,
-    chunk_size: Optional[int] = Query(None, ge=100, le=5000),
-    chunk_overlap: Optional[int] = Query(None, ge=0, le=1000),
-    similarity_threshold: Optional[float] = Query(None, ge=0.0, le=1.0),
     top_k: Optional[int] = Query(None, ge=1, le=20)
 ):
-    """RAG 쿼리 처리"""
+    """RAG 쿼리 처리 (JSON만 사용)"""
     try:
-        logger.info(f"쿼리 요청 받음: query='{request.query[:100] if request.query else 'None'}...', folder='{request.folder}'")
+        logger.info(f"쿼리 요청 받음: query='{request.query[:100] if request.query else 'None'}...', folder='{request.folder}', region='{request.region}'")
+        logger.info(f"요청 상세: {request.dict()}")
         
         # 요청 검증
         if not request.query or not request.query.strip():
+            logger.warning("빈 쿼리 요청")
             return QueryResponse(
                 answer="질문을 입력해주세요.",
                 chunks=[],
                 sources=[]
             )
         
-        response = await rag_service.query(
+        # RAG 서비스 가져오기 (지연 초기화)
+        try:
+            service = get_rag_service()
+        except Exception as e:
+            logger.error(f"RAG 서비스 초기화 실패: {str(e)}", exc_info=True)
+            return QueryResponse(
+                answer=f"서버 초기화 오류가 발생했습니다: {str(e)[:200]}",
+                chunks=[],
+                sources=[]
+            )
+        
+        response = await service.query(
             request=request,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            similarity_threshold=similarity_threshold,
             top_k=top_k
         )
         logger.info("쿼리 처리 완료")
         return response
     except ValueError as e:
-        logger.error(f"ValueError in query: {str(e)}")
+        logger.error(f"ValueError in query: {str(e)}", exc_info=True)
         return QueryResponse(
             answer=f"입력 오류: {str(e)}",
             chunks=[],
@@ -60,56 +81,4 @@ async def query_documents(
             sources=[]
         )
 
-@router.post("/evaluate")
-async def evaluate_retrieval(
-    query: str,
-    expected_documents: list[str]
-):
-    """문서 매칭 정확도 평가"""
-    try:
-        result = await rag_service.evaluate_retrieval_accuracy(
-            query=query,
-            expected_documents=expected_documents
-        )
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.put("/similarity-config")
-async def update_similarity_config(config: SimilarityConfig):
-    """유사도 설정 업데이트"""
-    try:
-        rag_service.retriever.update_config(
-            similarity_threshold=config.similarity_threshold,
-            top_k=config.top_k
-        )
-        return {"message": "Similarity configuration updated", "config": config}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.put("/chunk-config")
-async def update_chunk_config(config: ChunkConfig):
-    """청킹 설정 업데이트 (Row 단위 청킹 포함)"""
-    try:
-        rag_service.chunker.update_config(
-            chunk_size=config.chunk_size,
-            chunk_overlap=config.chunk_overlap,
-            chunk_by_row=config.chunk_by_row
-        )
-        return {"message": "Chunk configuration updated", "config": config}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.put("/weight-config")
-async def update_weight_config(config: RAGWeightConfig):
-    """RAG 가중치 설정 업데이트"""
-    try:
-        rag_service.retriever.update_config(
-            similarity_weight=config.similarity_weight,
-            recency_weight=config.recency_weight,
-            source_weight=config.source_weight
-        )
-        return {"message": "Weight configuration updated", "config": config}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 

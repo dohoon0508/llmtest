@@ -1,4 +1,5 @@
 import io
+import json
 from typing import Optional, List, Dict, Any
 import pandas as pd
 
@@ -10,7 +11,18 @@ class FileParser:
         """파일을 텍스트로 변환"""
         file_ext = filename.lower().split('.')[-1] if '.' in filename else ''
         
-        if file_ext in ['xlsx', 'xls']:
+        if file_ext == 'json':
+            # JSON 파일은 구조화된 파서로 처리 (parse_json_file 사용)
+            # 여기서는 기본 텍스트 변환만 수행
+            try:
+                decoded = file_content.decode('utf-8')
+                return decoded
+            except UnicodeDecodeError:
+                try:
+                    return file_content.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    return file_content.decode('latin-1')
+        elif file_ext in ['xlsx', 'xls']:
             return FileParser._parse_excel(file_content)
         elif file_ext == 'csv':
             return FileParser._parse_csv(file_content, filename)
@@ -242,5 +254,112 @@ class FileParser:
             logger = logging.getLogger(__name__)
             logger.error(f"법령 테이블 파싱 오류: {str(e)}")
             # 실패 시 일반 텍스트 추출
+            return []
+    
+    @staticmethod
+    def parse_json_file(file_content: bytes, filename: str, folder: str = None) -> List[Dict[str, Any]]:
+        """JSON 파일을 구조화된 청크로 파싱 (토큰 단위 처리)"""
+        try:
+            # JSON 디코딩
+            json_content = file_content.decode('utf-8')
+            data = json.loads(json_content)
+            
+            if not isinstance(data, list):
+                # 배열이 아니면 단일 객체를 배열로 변환
+                data = [data]
+            
+            chunks = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                
+                # JSON 항목을 구조화된 텍스트로 변환
+                chunk_text_parts = []
+                
+                # Q&A 형식 (Construction_law_qa.json)
+                if "question" in item and "answer" in item:
+                    chunk_text_parts.append(f"질문: {item.get('question', '')}")
+                    chunk_text_parts.append(f"답변: {item.get('answer', '')}")
+                    
+                    if item.get('category'):
+                        chunk_text_parts.append(f"카테고리: {item.get('category')}")
+                    if item.get('keywords'):
+                        keywords = item.get('keywords', [])
+                        if isinstance(keywords, list):
+                            chunk_text_parts.append(f"키워드: {', '.join(keywords)}")
+                    if item.get('legal_basis'):
+                        legal_basis = item.get('legal_basis', [])
+                        if isinstance(legal_basis, list) and legal_basis:
+                            chunk_text_parts.append(f"법적 근거: {', '.join(str(b) for b in legal_basis)}")
+                    if item.get('reference_document'):
+                        chunk_text_parts.append(f"참고 문서: {item.get('reference_document')}")
+                    if item.get('application_scope'):
+                        chunk_text_parts.append(f"적용 범위: {item.get('application_scope')}")
+                
+                # 조례 형식 (Jeonju_Construction_Ordinance.json)
+                elif "title" in item and "answer" in item:
+                    chunk_text_parts.append(f"제목: {item.get('title', '')}")
+                    if item.get('question'):
+                        chunk_text_parts.append(f"질문: {item.get('question')}")
+                    chunk_text_parts.append(f"답변: {item.get('answer', '')}")
+                    
+                    if item.get('category'):
+                        chunk_text_parts.append(f"카테고리: {item.get('category')}")
+                    if item.get('source_file'):
+                        chunk_text_parts.append(f"출처 파일: {item.get('source_file')}")
+                    if item.get('keywords'):
+                        keywords = item.get('keywords', [])
+                        if isinstance(keywords, list):
+                            chunk_text_parts.append(f"키워드: {', '.join(keywords)}")
+                    if item.get('regulation_type'):
+                        chunk_text_parts.append(f"규정 유형: {item.get('regulation_type')}")
+                    if item.get('jurisdiction'):
+                        chunk_text_parts.append(f"관할: {item.get('jurisdiction')}")
+                    if item.get('reference_law'):
+                        chunk_text_parts.append(f"참고 법령: {item.get('reference_law')}")
+                
+                # 기본 형식 (다른 필드들)
+                else:
+                    # 모든 필드를 텍스트로 변환
+                    for key, value in item.items():
+                        if value is not None:
+                            if isinstance(value, list):
+                                chunk_text_parts.append(f"{key}: {', '.join(str(v) for v in value)}")
+                            elif isinstance(value, dict):
+                                chunk_text_parts.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                            else:
+                                chunk_text_parts.append(f"{key}: {value}")
+                
+                # 청크 텍스트 생성
+                chunk_text = "\n".join(chunk_text_parts)
+                
+                # 메타데이터 구성
+                chunk_metadata = {
+                    "id": item.get("id", ""),
+                    "filename": filename,
+                    "folder": folder,
+                    "source_file": item.get("source_file", ""),
+                    "category": item.get("category", ""),
+                    "json_type": "qa" if "question" in item else "ordinance" if "title" in item else "general"
+                }
+                
+                # 원본 JSON 데이터도 메타데이터에 포함 (필요시 사용)
+                chunk_metadata.update({k: v for k, v in item.items() if k not in chunk_metadata})
+                
+                chunks.append({
+                    "content": chunk_text,
+                    "metadata": chunk_metadata
+                })
+            
+            return chunks
+        except json.JSONDecodeError as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"JSON 파싱 오류: {filename}, {str(e)}")
+            return []
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"JSON 파일 처리 오류: {filename}, {str(e)}")
             return []
 

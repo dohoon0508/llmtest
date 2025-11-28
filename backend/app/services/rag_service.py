@@ -1,80 +1,131 @@
 from typing import List, Dict, Any, Optional
+import time
+import asyncio
+import logging
 from app.models.rag_models import QueryRequest, QueryResponse, DocumentChunk
 from app.core.config import settings
-from rag.chunking.chunker import Chunker
-from rag.embedding.embedder import Embedder
-from rag.retrieval.retriever import Retriever
+from rag.retrieval.json_index import JSONIndex
 from rag.llm.llm_client import LLMClient
 
 class RAGService:
     def __init__(self):
-        import logging
         logger = logging.getLogger(__name__)
         
-        self.chunker = Chunker(
-            chunk_size=settings.CHUNK_SIZE,
-            chunk_overlap=settings.CHUNK_OVERLAP
-        )
-        
-        # OpenAI API 키 확인
+        # OpenAI API 키 확인 (LLM만 사용)
         if not settings.OPENAI_API_KEY or settings.OPENAI_API_KEY == "":
             logger.warning("OpenAI API 키가 설정되지 않았습니다. .env 파일을 확인해주세요.")
-            self.embedder = None
             self.llm_client = None
         else:
             try:
-                self.embedder = Embedder(
-                    api_key=settings.OPENAI_API_KEY,
-                    model=settings.OPENAI_EMBEDDING_MODEL
-                )
                 self.llm_client = LLMClient(
                     api_key=settings.OPENAI_API_KEY,
                     model=settings.OPENAI_MODEL
                 )
+                logger.info("OpenAI LLM 클라이언트 초기화 완료")
             except Exception as e:
-                logger.error(f"OpenAI 클라이언트 초기화 실패: {str(e)}")
-                self.embedder = None
+                logger.error(f"OpenAI LLM 클라이언트 초기화 실패: {str(e)}", exc_info=True)
                 self.llm_client = None
         
-        self.retriever = Retriever(
-            vector_store_path=settings.VECTOR_STORE_PATH,
-            top_k=settings.TOP_K_DOCUMENTS,
-            similarity_threshold=settings.SIMILARITY_THRESHOLD
-        )
+        # JSON 인덱스 초기화 (JSON만 사용)
+        try:
+            self.json_index = JSONIndex()
+            self._load_json_index()
+            logger.info("JSON 인덱스 초기화 완료")
+        except Exception as e:
+            logger.error(f"JSON 인덱스 초기화 실패: {str(e)}", exc_info=True)
+            raise RuntimeError(f"JSON 인덱스 초기화 실패: {str(e)}") from e
+    
+    def _load_json_index(self):
+        """documents 폴더의 JSON 파일들을 JSON 인덱스에 로드"""
+        logger = logging.getLogger(__name__)
+        
+        from pathlib import Path
+        documents_dir = Path(settings.DOCUMENTS_DIR)
+        
+        if not documents_dir.exists():
+            logger.warning(f"documents 폴더가 없습니다: {documents_dir}")
+            return
+        
+        json_count = 0
+        
+        # 모든 폴더에서 JSON 파일 찾기
+        for folder_path in documents_dir.iterdir():
+            if not folder_path.is_dir():
+                continue
+            
+            folder_name = folder_path.name
+            
+            # 폴더 내의 JSON 파일 찾기
+            for json_file in folder_path.glob("*.json"):
+                if json_file.name.startswith('~$'):
+                    continue
+                if self.json_index.load_json_file(json_file, folder_name):
+                    json_count += 1
+        
+        # 루트 폴더의 JSON 파일도 찾기
+        for json_file in documents_dir.glob("*.json"):
+            if json_file.name.startswith('~$'):
+                continue
+            if self.json_index.load_json_file(json_file, ""):
+                json_count += 1
+        
+        # region 폴더의 JSON 파일 (지역명을 폴더명으로 사용)
+        # 파일명 매핑: Jeonju_Construction_Ordinance.json -> 전주시
+        region_folder = documents_dir / "region"
+        if region_folder.exists():
+            # 지역명 매핑 (JSON 파일명 -> 지역명)
+            region_file_mapping = {
+                "Jeonju_Construction_Ordinance.json": "전주시"
+                # 향후 다른 지역 추가:
+                # "Seoul_Construction_Ordinance.json": "서울시",
+                # "Busan_Construction_Ordinance.json": "부산시",
+            }
+            
+            for json_file in region_folder.glob("*.json"):
+                if json_file.name.startswith('~$'):
+                    continue
+                
+                # 파일명으로 지역명 찾기
+                region_name = region_file_mapping.get(json_file.name)
+                if not region_name:
+                    # 매핑에 없으면 파일명에서 추출 시도
+                    if "Jeonju" in json_file.name or "전주" in json_file.name:
+                        region_name = "전주시"
+                    else:
+                        # 기본값으로 "region" 사용 (향후 확장 고려)
+                        region_name = "region"
+                
+                if self.json_index.load_json_file(json_file, region_name):
+                    json_count += 1
+                    logger.info(f"지역 JSON 파일 인덱싱: {region_name}/{json_file.name}")
+        
+        logger.info(f"JSON 인덱스 로드 완료: {json_count}개 JSON 파일 인덱싱됨")
     
     async def query(
         self,
         request: QueryRequest,
-        chunk_size: Optional[int] = None,
-        chunk_overlap: Optional[int] = None,
-        similarity_threshold: Optional[float] = None,
         top_k: Optional[int] = None
     ) -> QueryResponse:
-        """RAG 쿼리 처리"""
-        import logging
+        """RAG 쿼리 처리 (JSON만 사용)"""
         logger = logging.getLogger(__name__)
         
         try:
-            # OpenAI 클라이언트 확인
-            if self.embedder is None or self.llm_client is None:
-                logger.error("OpenAI 클라이언트가 초기화되지 않았습니다.")
+            # OpenAI LLM 클라이언트 확인
+            if self.llm_client is None:
+                logger.error("OpenAI LLM 클라이언트가 초기화되지 않았습니다.")
                 return QueryResponse(
                     answer="죄송합니다. OpenAI API 키가 설정되지 않았습니다. backend/.env 파일에 OPENAI_API_KEY를 설정하고 서버를 재시작해주세요.",
                     chunks=[],
                     sources=[]
                 )
             
-            # 설정 업데이트
-            if chunk_size or chunk_overlap:
-                self.chunker.update_config(
-                    chunk_size=chunk_size or settings.CHUNK_SIZE,
-                    chunk_overlap=chunk_overlap or settings.CHUNK_OVERLAP
-                )
-            
-            if similarity_threshold or top_k:
-                self.retriever.update_config(
-                    similarity_threshold=similarity_threshold or settings.SIMILARITY_THRESHOLD,
-                    top_k=top_k or request.top_k or settings.TOP_K_DOCUMENTS
+            # JSON 인덱스 확인
+            if self.json_index is None:
+                logger.error("JSON 인덱스가 초기화되지 않았습니다.")
+                return QueryResponse(
+                    answer="죄송합니다. JSON 인덱스 초기화에 실패했습니다. 서버 로그를 확인해주세요.",
+                    chunks=[],
+                    sources=[]
                 )
             
             # 폴더 필터링 확인 (필수)
@@ -87,58 +138,57 @@ class RAGService:
                     sources=[]
                 )
             
-            # OpenAI API 키 확인
-            if not self.embedder or not self.llm_client:
-                logger.error("OpenAI API 키가 설정되지 않았습니다.")
-                return QueryResponse(
-                    answer="죄송합니다. OpenAI API 키가 설정되지 않았습니다. 서버 관리자에게 문의해주세요.\n\n.env 파일에 OPENAI_API_KEY를 설정해야 합니다.",
-                    chunks=[],
-                    sources=[]
-                )
+            # 지역 필터링 (선택사항)
+            region_filter = request.region
+            if region_filter:
+                region_filter = region_filter.strip()
+                logger.info(f"지역 필터 적용: {region_filter}")
             
-            # 문서 검색
-            logger.info(f"쿼리 임베딩 생성 시작: {request.query[:50]}...")
+            logger.info(f"검색 필터 - 건물 타입: {folder_filter}, 지역: {region_filter or '없음'}")
+            
+            # JSON 인덱스 검색 (JSON만 사용)
+            start_time = time.time()
+            json_results = []
+            
             try:
-                # 쿼리 자체는 그대로 사용 (파일명 매칭은 임베딩에서 자동으로 처리됨)
-                query_embedding = await self.embedder.embed_query(request.query)
-                logger.info(f"쿼리 임베딩 생성 완료: {len(query_embedding)} 차원")
+                search_top_k = top_k or request.top_k or 5
+                json_results = self.json_index.search(
+                    query=request.query,
+                    folder_filter=folder_filter,
+                    region_filter=region_filter,
+                    top_k=search_top_k
+                )
+                search_time = time.time() - start_time
+                
+                if json_results:
+                    logger.info(f"JSON 인덱스 검색 완료: {len(json_results)}개 결과, {search_time:.3f}초")
+                else:
+                    logger.warning(f"JSON 검색 결과 없음: {search_time:.3f}초")
             except Exception as e:
-                logger.error(f"쿼리 임베딩 생성 실패: {str(e)}", exc_info=True)
+                logger.error(f"JSON 인덱스 검색 실패: {str(e)}", exc_info=True)
                 return QueryResponse(
-                    answer=f"죄송합니다. 질문을 처리하는 중 오류가 발생했습니다: {str(e)[:200]}",
+                    answer=f"죄송합니다. 검색 중 오류가 발생했습니다: {str(e)[:200]}",
                     chunks=[],
                     sources=[]
                 )
             
-            logger.info("문서 검색 시작...")
-            
-            # 파일 필터링 설정 (4, 5-1, 5-2 파일만)
-            filename_filter = ["4.", "5-1.", "5-2."]
-            
-            logger.info(f"폴더 필터: {folder_filter}, 파일 필터: {filename_filter}")
-            
-            # 유사도 임계값 설정 (기본값을 낮춰서 더 많은 문서 검색)
-            final_threshold = similarity_threshold or request.similarity_threshold or 0.1  # 최소 0.1로 설정
-            
-            logger.info(f"유사도 임계값: {final_threshold}")
-            
-            retrieved_chunks = await self.retriever.retrieve(
-                query_embedding=query_embedding,
-                top_k=top_k or request.top_k or settings.TOP_K_DOCUMENTS,
-                similarity_threshold=final_threshold,
-                folder_filter=folder_filter,
-                filename_filter=filename_filter if folder_filter else None  # 폴더가 선택된 경우만 파일 필터링
-            )
-            logger.info(f"문서 검색 완료: {len(retrieved_chunks)}개 청크 발견")
-        
             # 검색된 문서가 없는 경우 처리
-            if not retrieved_chunks or len(retrieved_chunks) == 0:
+            if not json_results or len(json_results) == 0:
                 logger.warning(f"검색된 문서가 없습니다. (폴더: {folder_filter}, 쿼리: {request.query[:50]}...)")
                 return QueryResponse(
-                    answer=f"죄송합니다. 선택하신 건축 양식({folder_filter})의 문서에서 질문과 관련된 내용을 찾을 수 없습니다.\n\n다음 사항을 확인해주세요:\n1. 해당 폴더에 문서가 업로드되어 있는지\n2. 문서 이름이 '4.', '5-1.', '5-2.'로 시작하는지\n3. 질문을 다시 정리해서 시도해보세요",
+                    answer=f"죄송합니다. 선택하신 건축 양식({folder_filter})의 JSON 문서에서 질문과 관련된 내용을 찾을 수 없습니다.\n\n다음 사항을 확인해주세요:\n1. 해당 폴더에 Construction_law_qa.json 파일이 있는지\n2. 질문을 다시 정리해서 시도해보세요",
                     chunks=[],
                     sources=[]
                 )
+            
+            # JSON 결과를 retrieved_chunks로 변환
+            retrieved_chunks = []
+            for json_result in json_results:
+                retrieved_chunks.append({
+                    "content": json_result["content"],
+                    "metadata": json_result["metadata"],
+                    "score": json_result.get("score", 1.0)
+                })
             
             # 응답 구성 (안전한 데이터 접근) - LLM 호출 전에 먼저 처리
             document_chunks = []
@@ -152,10 +202,10 @@ class RAGService:
                     
                     # 내용이 있고 비어있지 않은 경우만 추가
                     if content and content.strip():
-                        # score 안전하게 처리 (None이거나 숫자가 아닌 경우 기본값 0.0)
+                        # score 안전하게 처리
                         score = chunk.get("score")
                         if score is None or not isinstance(score, (int, float)):
-                            score = 0.0
+                            score = 1.0
                         else:
                             score = float(score)
                         
@@ -170,10 +220,16 @@ class RAGService:
                         # 컨텍스트용 텍스트 수집
                         context_parts.append(content.strip())
                         
-                        # 출처 추가 (안전하게)
+                        # 출처 추가
                         source = metadata.get("source")
                         if source and isinstance(source, str) and source.strip():
                             sources_set.add(source.strip())
+                        elif metadata.get("filename"):
+                            folder = metadata.get("folder", "")
+                            if folder:
+                                sources_set.add(f"{folder}/{metadata.get('filename')}")
+                            else:
+                                sources_set.add(metadata.get("filename"))
                 except Exception as e:
                     logger.warning(f"청크 처리 중 오류 (스킵): {str(e)}")
                     continue
@@ -184,88 +240,49 @@ class RAGService:
             # 컨텍스트가 비어있는 경우 처리
             if not context.strip():
                 logger.warning("컨텍스트가 비어있습니다.")
-                if not retrieved_chunks or len(retrieved_chunks) == 0:
-                    return QueryResponse(
-                        answer=f"죄송합니다. '{folder_filter}' 폴더에서 질문과 관련된 문서를 찾을 수 없습니다.\n\n다음 사항을 확인해주세요:\n1. 해당 폴더에 문서가 업로드되어 있는지\n2. 문서 이름이 '4.', '5-1.', '5-2.'로 시작하는지\n3. 질문을 다시 정리해서 시도해보세요",
-                        chunks=[],
-                        sources=[]
-                    )
-                else:
-                    # 청크는 있지만 내용이 비어있는 경우
-                    return QueryResponse(
-                        answer="죄송합니다. 관련 문서를 찾았지만 내용을 추출할 수 없습니다. 문서 형식을 확인해주세요.",
-                        chunks=document_chunks,
-                        sources=list(sources_set)
-                    )
-            
-            logger.info(f"LLM 답변 생성 시작 (컨텍스트 길이: {len(context)} 문자, 청크 수: {len(document_chunks)}개)")
-            try:
-                # 구조화된 청크가 있는지 확인 (scenario, law_group 등의 필드 존재)
-                has_structured_chunks = any(
-                    (chunk.get("metadata") or {}).get("scenario") or 
-                    (chunk.get("metadata") or {}).get("law_group")
-                    for chunk in retrieved_chunks
+                return QueryResponse(
+                    answer=f"죄송합니다. '{folder_filter}' 폴더의 JSON 문서에서 질문과 관련된 내용을 찾을 수 없습니다.",
+                    chunks=[],
+                    sources=[]
                 )
-                
-                # 구조화된 청크가 있으면 구조화된 형식으로 전달
-                if has_structured_chunks:
-                    from rag.llm.prompts import format_context_chunks
-                    chunks_list = [
-                        {
-                            **chunk.get("metadata", {}),
-                            "content": chunk.get("content", ""),
-                            "review_text": chunk.get("metadata", {}).get("review_text", ""),
-                            "law_text": chunk.get("metadata", {}).get("law_text", ""),
-                        }
-                        for chunk in retrieved_chunks
-                    ]
-                    answer = await self.llm_client.generate_answer(
-                        query=request.query,
-                        chunks=chunks_list,
-                        scenario=folder_filter
-                    )
-                else:
-                    # 기본 방식 (기존 구조화되지 않은 청크)
-                    answer = await self.llm_client.generate_answer(
+            
+            # LLM 답변 생성
+            llm_start = time.time()
+            logger.info(f"LLM 답변 생성 시작 (컨텍스트: {len(context)}자, 청크: {len(document_chunks)}개)")
+            try:
+                # 타임아웃 설정: 최대 20초
+                answer = await asyncio.wait_for(
+                    self.llm_client.generate_answer(
                         query=request.query,
                         context=context,
-                        scenario=folder_filter
-                    )
-                logger.info("LLM 답변 생성 완료")
-                
-                # 답변 검증
-                if not answer or not answer.strip():
-                    logger.error("LLM이 빈 응답을 반환했습니다.")
-                    return QueryResponse(
-                        answer="죄송합니다. 답변 생성에 실패했습니다. 검색된 문서 정보는 아래 참고 문서에서 확인하실 수 있습니다.",
-                        chunks=document_chunks,
-                        sources=list(sources_set)
-                    )
+                        scenario=folder_filter,
+                        region=region_filter
+                    ),
+                    timeout=20.0
+                )
+                llm_time = time.time() - llm_start
+                logger.info(f"LLM 답변 생성 완료: {llm_time:.2f}초")
+            except asyncio.TimeoutError:
+                logger.error("LLM 답변 생성 타임아웃 (20초 초과)")
+                return QueryResponse(
+                    answer="죄송합니다. 답변 생성 시간이 초과되었습니다. 질문을 더 간단하게 다시 시도해주세요.",
+                    chunks=document_chunks,
+                    sources=list(sources_set)
+                )
             except Exception as e:
                 logger.error(f"LLM 답변 생성 실패: {str(e)}", exc_info=True)
-                import traceback
-                error_detail = traceback.format_exc()
-                logger.error(f"상세 오류:\n{error_detail}")
-                
-                # 사용자 친화적인 에러 메시지
-                error_msg = str(e)
-                if "API key" in error_msg or "authentication" in error_msg.lower():
-                    error_msg = "OpenAI API 키가 설정되지 않았거나 잘못되었습니다."
-                elif len(error_msg) > 300:
-                    error_msg = error_msg[:300] + "..."
-                
                 return QueryResponse(
-                    answer=f"죄송합니다. 답변 생성 중 오류가 발생했습니다.\n\n오류: {error_msg}\n\n검색된 문서 정보는 아래 참고 문서에서 확인하실 수 있습니다.",
+                    answer="죄송합니다. 답변 생성 중 오류가 발생했습니다. 검색된 문서 정보는 아래 참고 문서에서 확인하실 수 있습니다.",
                     chunks=document_chunks,
                     sources=list(sources_set)
                 )
             
-            logger.info(f"응답 구성 완료: {len(document_chunks)}개 청크, {len(sources_set)}개 출처")
             return QueryResponse(
                 answer=answer,
                 chunks=document_chunks,
                 sources=list(sources_set)
             )
+    
         except ValueError as e:
             logger.error(f"ValueError in query: {str(e)}")
             return QueryResponse(
@@ -281,36 +298,4 @@ class RAGService:
                 sources=[]
             )
     
-    async def evaluate_retrieval_accuracy(
-        self,
-        query: str,
-        expected_documents: List[str]
-    ) -> Dict[str, Any]:
-        """문서 매칭 정확도 평가"""
-        query_embedding = await self.embedder.embed_query(query)
-        retrieved_chunks = await self.retriever.retrieve(
-            query_embedding=query_embedding,
-            top_k=settings.TOP_K_DOCUMENTS,
-            similarity_threshold=settings.SIMILARITY_THRESHOLD
-        )
-        
-        retrieved_sources = [
-            chunk.get("metadata", {}).get("source", "unknown")
-            for chunk in retrieved_chunks
-        ]
-        
-        matched = len(set(retrieved_sources) & set(expected_documents))
-        precision = matched / len(retrieved_sources) if retrieved_sources else 0
-        recall = matched / len(expected_documents) if expected_documents else 0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-        
-        return {
-            "query": query,
-            "expected_documents": expected_documents,
-            "retrieved_documents": retrieved_sources,
-            "matched_count": matched,
-            "precision": precision,
-            "recall": recall,
-            "f1_score": f1
-        }
 

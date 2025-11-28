@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 
-function ChatSection({ selectedFolder }) {
+function ChatSection({ selectedFolder, selectedRegion }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -25,9 +25,9 @@ function ChatSection({ selectedFolder }) {
   }, [messages])
 
   useEffect(() => {
-    // 폴더가 변경되면 메시지 초기화
+    // 폴더나 지역이 변경되면 메시지 초기화
     setMessages([])
-  }, [selectedFolder])
+  }, [selectedFolder, selectedRegion])
 
   const handleSend = async (e) => {
     e.preventDefault()
@@ -44,7 +44,10 @@ function ChatSection({ selectedFolder }) {
     try {
       const response = await axios.post('/api/rag/query', {
         query: userMessage,
-        folder: selectedFolder  // 선택된 폴더 전달
+        folder: selectedFolder,  // 선택된 폴더 전달
+        region: selectedRegion   // 선택된 지역 전달 (선택사항)
+      }, {
+        timeout: 90000  // 90초 타임아웃
       })
 
       setMessages([

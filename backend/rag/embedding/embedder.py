@@ -11,19 +11,28 @@ class Embedder:
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
     
-    @retry_with_backoff(
-        max_retries=3,
-        initial_delay=1.0,
-        max_delay=10.0,
-        exponential_base=2.0,
-        exceptions=(APIError, RateLimitError, APIConnectionError, Exception)
-    )
     async def _call_openai_embedding(self, input_data):
-        """OpenAI Embedding API 호출 (재시도 로직 포함)"""
-        return await self.client.embeddings.create(
-            model=self.model,
-            input=input_data
-        )
+        """OpenAI Embedding API 호출 (타임아웃 설정, 재시도 없음 - 빠른 실패)"""
+        import asyncio
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        try:
+            # 타임아웃 설정: 10초 (재시도 없이 빠르게)
+            return await asyncio.wait_for(
+                self.client.embeddings.create(
+                    model=self.model,
+                    input=input_data,
+                    timeout=10.0  # OpenAI 클라이언트 타임아웃
+                ),
+                timeout=12.0  # 전체 타임아웃
+            )
+        except asyncio.TimeoutError:
+            logger.error("OpenAI Embedding API 호출 타임아웃 (10초 초과)")
+            raise TimeoutError("임베딩 생성이 10초를 초과했습니다.")
+        except (APIError, RateLimitError, APIConnectionError) as e:
+            logger.error(f"OpenAI Embedding API 오류: {str(e)}")
+            raise
     
     async def embed_text(self, text: str) -> List[float]:
         """텍스트 임베딩 생성"""

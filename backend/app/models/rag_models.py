@@ -5,7 +5,8 @@ class QueryRequest(BaseModel):
     query: str = Field(..., description="사용자 질문")
     top_k: Optional[int] = Field(None, description="반환할 문서 개수")
     similarity_threshold: Optional[float] = Field(None, description="유사도 임계값")
-    folder: Optional[str] = Field(None, description="검색할 폴더명 (예: 신축_일반개인_다중주택)")
+    folder: Optional[str] = Field(None, description="검색할 폴더명 (건물 타입, 예: 다중주택)")
+    region: Optional[str] = Field(None, description="검색할 지역명 (예: 전주시)")
 
 class DocumentChunk(BaseModel):
     content: str

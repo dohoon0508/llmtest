@@ -13,7 +13,8 @@ def retry_with_backoff(
     initial_delay: float = 1.0,
     max_delay: float = 10.0,
     exponential_base: float = 2.0,
-    exceptions: tuple = (Exception,)
+    exceptions: tuple = (Exception,),
+    max_total_time: float = 60.0  # 최대 총 재시도 시간 (초)
 ):
     """
     재시도 로직이 포함된 데코레이터
@@ -28,15 +29,39 @@ def retry_with_backoff(
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def async_wrapper(*args, **kwargs) -> T:
+            import time
             delay = initial_delay
             last_exception = None
+            start_time = time.time()
             
             for attempt in range(max_retries):
+                # 최대 총 시간 체크
+                elapsed = time.time() - start_time
+                if elapsed > max_total_time:
+                    logger.error(
+                        f"{func.__name__} 최대 재시도 시간 초과 ({max_total_time}초). "
+                        f"시도 횟수: {attempt + 1}/{max_retries}"
+                    )
+                    if last_exception:
+                        raise TimeoutError(
+                            f"최대 재시도 시간({max_total_time}초)을 초과했습니다. "
+                            f"마지막 오류: {str(last_exception)}"
+                        ) from last_exception
+                    raise TimeoutError(f"최대 재시도 시간({max_total_time}초)을 초과했습니다.")
+                
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
                     last_exception = e
                     if attempt < max_retries - 1:
+                        # 남은 시간 체크
+                        remaining_time = max_total_time - (time.time() - start_time)
+                        if remaining_time < delay:
+                            logger.warning(
+                                f"{func.__name__} 재시도 시간 부족. 남은 시간: {remaining_time:.2f}초"
+                            )
+                            break
+                        
                         logger.warning(
                             f"{func.__name__} 실패 (시도 {attempt + 1}/{max_retries}): {str(e)}. "
                             f"{delay:.2f}초 후 재시도..."
@@ -48,7 +73,9 @@ def retry_with_backoff(
                             f"{func.__name__} 최종 실패 (시도 {max_retries}회): {str(e)}"
                         )
             
-            raise last_exception
+            if last_exception:
+                raise last_exception
+            raise TimeoutError(f"{func.__name__} 최대 재시도 횟수 초과")
         
         @wraps(func)
         def sync_wrapper(*args, **kwargs) -> T:

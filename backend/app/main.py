@@ -1,10 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from app.api import rag_router, document_router
 from app.core.config import settings
-from app.services.document_service import DocumentService
 import logging
-import asyncio
+import traceback
 
 # 로깅 설정
 logging.basicConfig(
@@ -17,6 +18,35 @@ app = FastAPI(
     description="RAG 실습을 위한 API",
     version="1.0.0"
 )
+
+# 전역 예외 핸들러 추가
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Pydantic validation error 처리"""
+    logger = logging.getLogger(__name__)
+    logger.error(f"Validation error: {exc.errors()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": exc.errors(),
+            "message": "요청 데이터 검증 실패"
+        }
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """전역 예외 처리"""
+    logger = logging.getLogger(__name__)
+    error_detail = f"{str(exc)}\n{traceback.format_exc()}"
+    logger.error(f"Unhandled exception: {error_detail}")
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": str(exc),
+            "message": "서버 내부 오류가 발생했습니다."
+        }
+    )
 
 # CORS 설정
 app.add_middleware(
@@ -43,13 +73,5 @@ async def health():
 async def startup_event():
     """서버 시작 시 실행되는 이벤트"""
     logger = logging.getLogger(__name__)
-    logger.info("서버 시작 중... documents 폴더의 기존 문서를 로드합니다.")
-    
-    try:
-        document_service = DocumentService()
-        loaded_count = await document_service.load_existing_documents()
-        logger.info(f"서버 시작 완료. {loaded_count}개의 문서가 자동으로 로드되었습니다.")
-    except Exception as e:
-        logger.error(f"문서 자동 로드 중 오류 발생: {str(e)}")
-        # 오류가 있어도 서버는 계속 실행
+    logger.info("서버 시작 완료. JSON 인덱스는 RAGService 초기화 시 자동으로 로드됩니다.")
 
